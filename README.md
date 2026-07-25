@@ -5,6 +5,7 @@ A lightweight real-time GUI monitor for SwitchBot BLE temperature, humidity, and
 ## Features
 
 - Real-time monitoring
+- CSV log export (every 15 min)
 - No cloud access
 - No pairing required
 - Direct BLE advertisement scanning
