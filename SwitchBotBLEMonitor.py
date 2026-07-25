@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import queue
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import tkinter as tk
@@ -41,6 +43,8 @@ METER_MODEL_IDS = {
 }
 
 CO2_MODEL_IDS = {0x35, 0x15}
+
+LOG_INTERVAL_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -214,6 +218,10 @@ class SwitchBotBleMonitorApp:
         self.stop_event = threading.Event()
         self.scan_thread: Optional[threading.Thread] = None
         self.status_var = tk.StringVar(value="Idle")
+        self.latest_readings: dict[str, SensorReading] = {}
+        self._log_after_id: Optional[str] = None
+        self._logging = False
+        self.log_path = Path(__file__).resolve().parent / "log.csv"
 
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -315,6 +323,12 @@ class SwitchBotBleMonitorApp:
             return
 
         self.stop_event.clear()
+        self.latest_readings.clear()
+        for item_id in self.tree.get_children(""):
+            self.tree.delete(item_id)
+
+        if not self._start_logging():
+            return
 
         self.scan_thread = threading.Thread(
             target=self._scanner_thread_main,
@@ -328,6 +342,7 @@ class SwitchBotBleMonitorApp:
 
     def stop_scan(self) -> None:
         self.stop_event.set()
+        self._stop_logging()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="disabled")
         self.status_var.set("Stopping...")
@@ -427,6 +442,7 @@ class SwitchBotBleMonitorApp:
                             self.stop_button.config(state="disabled")
 
                     elif kind == "error":
+                        self._stop_logging()
                         self.status_var.set("Error")
                         messagebox.showerror("BLE Scan Error", str(value))
                         self.start_button.config(state="normal")
@@ -440,6 +456,7 @@ class SwitchBotBleMonitorApp:
     def _update_reading(self, r: SensorReading) -> None:
         display_mac = r.mac_address or r.ble_address or r.key
         row_id = r.ble_address or r.mac_address or r.key
+        self.latest_readings[r.key] = r
 
         last_seen = datetime.fromtimestamp(r.seen_at).strftime("%H:%M:%S")
         temp = "" if r.temperature_c is None else f"{r.temperature_c:.1f}"
@@ -465,6 +482,82 @@ class SwitchBotBleMonitorApp:
 
         self._sort_rows_by_mac()
 
+    def _start_logging(self) -> bool:
+        """Create a fresh log file and begin 15-minute snapshots."""
+        self._stop_logging()
+
+        try:
+            with self.log_path.open("w", newline="", encoding="utf-8-sig") as log_file:
+                csv.writer(log_file).writerow(
+                    ("Timestamp", "MAC Address", "Temperature (C)", "Humidity (%)")
+                )
+        except OSError as e:
+            messagebox.showerror(
+                "Log File Error",
+                f"Could not create the log file.\n\n{self.log_path}\n\n{e}",
+            )
+            return False
+
+        self._logging = True
+        self._schedule_next_log()
+        return True
+
+    def _schedule_next_log(self) -> None:
+        if self._logging:
+            self._log_after_id = self.root.after(
+                LOG_INTERVAL_SECONDS * 1000,
+                self._write_log_snapshot,
+            )
+
+    def _write_log_snapshot(self) -> None:
+        self._log_after_id = None
+
+        if not self._logging:
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stale_before = time.time() - LOG_INTERVAL_SECONDS
+
+        try:
+            with self.log_path.open("a", newline="", encoding="utf-8") as log_file:
+                writer = csv.writer(log_file)
+                for sensor_key in sorted(self.latest_readings, key=_mac_sort_key):
+                    reading = self.latest_readings[sensor_key]
+                    available = reading.seen_at >= stale_before
+                    temperature = (
+                        f"{reading.temperature_c:.1f}"
+                        if available and reading.temperature_c is not None
+                        else ""
+                    )
+                    humidity = (
+                        str(reading.humidity)
+                        if available and reading.humidity is not None
+                        else ""
+                    )
+                    writer.writerow(
+                        (
+                            timestamp,
+                            reading.mac_address or reading.ble_address or sensor_key,
+                            temperature,
+                            humidity,
+                        )
+                    )
+        except OSError as e:
+            self._logging = False
+            messagebox.showerror(
+                "Log File Error",
+                f"Could not write to the log file.\n\n{self.log_path}\n\n{e}",
+            )
+            return
+
+        self._schedule_next_log()
+
+    def _stop_logging(self) -> None:
+        self._logging = False
+        if self._log_after_id is not None:
+            self.root.after_cancel(self._log_after_id)
+            self._log_after_id = None
+
     def _sort_rows_by_mac(self) -> None:
         rows = list(self.tree.get_children(""))
         rows.sort(key=lambda item_id: _mac_sort_key(str(self.tree.set(item_id, "mac"))))
@@ -474,6 +567,7 @@ class SwitchBotBleMonitorApp:
 
     def _on_close(self) -> None:
         self.stop_event.set()
+        self._stop_logging()
         self.root.after(150, self.root.destroy)
 
 
